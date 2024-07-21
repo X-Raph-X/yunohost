@@ -301,7 +301,6 @@ def tools_regen_conf(
 ):
 
     from yunohost.regenconf import regen_conf
-
     return regen_conf(names, with_diff, force, dry_run, list_pending)
 
 
