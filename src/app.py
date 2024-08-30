@@ -328,10 +328,7 @@ def app_map(app=None, raw=False, user=None):
     result = {}
 
     if app is not None:
-        if not _is_installed(app):
-            raise YunohostValidationError(
-                "app_not_installed", app=app, all_apps=_get_all_installed_apps_id()
-            )
+        _assert_is_installed(app)
         apps = [
             app,
         ]
@@ -849,6 +846,41 @@ def app_upgrade(
                     + "\n     -".join(manually_modified_files_by_app)
                 )
 
+            # If the upgrade didnt fail, update the revision and app files (even if it broke the system, otherwise we end up in a funky intermediate state where the app files don't match the installed version or settings, for example for v1->v2 upgrade marked as "broke the system" for some reason)
+            if not upgrade_failed:
+                now = int(time.time())
+                app_setting(app_instance_name, "update_time", now)
+                app_setting(
+                    app_instance_name,
+                    "current_revision",
+                    manifest.get("remote", {}).get("revision", "?"),
+                )
+
+                # Clean hooks and add new ones
+                hook_remove(app_instance_name)
+                if "hooks" in os.listdir(extracted_app_folder):
+                    for hook in os.listdir(extracted_app_folder + "/hooks"):
+                        hook_add(
+                            app_instance_name, extracted_app_folder + "/hooks/" + hook
+                        )
+
+                # Replace scripts and manifest and conf (if exists)
+                # Move scripts and manifest to the right place
+                for file_to_copy in APP_FILES_TO_COPY:
+                    rm(f"{app_setting_path}/{file_to_copy}", recursive=True, force=True)
+                    if os.path.exists(os.path.join(extracted_app_folder, file_to_copy)):
+                        cp(
+                            f"{extracted_app_folder}/{file_to_copy}",
+                            f"{app_setting_path}/{file_to_copy}",
+                            recursive=True,
+                        )
+
+                # Clean and set permissions
+                shutil.rmtree(extracted_app_folder)
+                chmod(app_setting_path, 0o600)
+                chmod(f"{app_setting_path}/settings.yml", 0o400)
+                chown(app_setting_path, "root", recursive=True)
+
             # If upgrade failed or broke the system,
             # raise an error and interrupt all other pending upgrades
             if upgrade_failed or broke_the_system:
@@ -899,36 +931,6 @@ def app_upgrade(
                     )
 
             # Otherwise we're good and keep going !
-            now = int(time.time())
-            app_setting(app_instance_name, "update_time", now)
-            app_setting(
-                app_instance_name,
-                "current_revision",
-                manifest.get("remote", {}).get("revision", "?"),
-            )
-
-            # Clean hooks and add new ones
-            hook_remove(app_instance_name)
-            if "hooks" in os.listdir(extracted_app_folder):
-                for hook in os.listdir(extracted_app_folder + "/hooks"):
-                    hook_add(app_instance_name, extracted_app_folder + "/hooks/" + hook)
-
-            # Replace scripts and manifest and conf (if exists)
-            # Move scripts and manifest to the right place
-            for file_to_copy in APP_FILES_TO_COPY:
-                rm(f"{app_setting_path}/{file_to_copy}", recursive=True, force=True)
-                if os.path.exists(os.path.join(extracted_app_folder, file_to_copy)):
-                    cp(
-                        f"{extracted_app_folder}/{file_to_copy}",
-                        f"{app_setting_path}/{file_to_copy}",
-                        recursive=True,
-                    )
-
-            # Clean and set permissions
-            shutil.rmtree(extracted_app_folder)
-            chmod(app_setting_path, 0o600)
-            chmod(f"{app_setting_path}/settings.yml", 0o400)
-            chown(app_setting_path, "root", recursive=True)
 
             # So much win
             logger.success(m18n.n("app_upgraded", app=app_instance_name))
@@ -1419,10 +1421,7 @@ def app_remove(operation_logger, app, purge=False, force_workdir=None):
     )
     from yunohost.domain import domain_list, domain_config_get, domain_config_set
 
-    if not _is_installed(app):
-        raise YunohostValidationError(
-            "app_not_installed", app=app, all_apps=_get_all_installed_apps_id()
-        )
+    _assert_is_installed(app)
 
     operation_logger.start()
 
@@ -1999,6 +1998,7 @@ ynh_app_config_run $1
                 "install_dir": settings.get("install_dir", ""),
                 "YNH_APP_BASEDIR": os.path.join(APPS_SETTING_PATH, app),
                 "YNH_APP_PACKAGING_FORMAT": str(manifest["packaging_format"]),
+                "YNH_APP_CONFIG_PANEL_OPTIONS_TYPES_AND_BINDS": self._dump_options_types_and_binds(),
             }
         )
         app_script_env = _make_environment_for_app_script(app)
@@ -2017,8 +2017,68 @@ ynh_app_config_run $1
                 raise YunohostError("app_action_failed", action=action, app=app)
         return values
 
+    def _get_config_panel(self):
 
-def _get_app_settings(app):
+        ret = super()._get_config_panel()
+
+        self._compute_binds()
+
+        return ret
+
+    def _compute_binds(self):
+        """
+        This compute the 'bind' statement for every option
+        In particular to handle __FOOBAR__ syntax
+        and to handle the fact that bind statements may be defined panel-wide or section-wide
+        """
+
+        settings = _get_app_settings(self.entity)
+
+        for panel, section, option in self._iterate():
+
+            bind_panel = panel.get("bind")
+
+            bind_section = section.get("bind")
+            if not bind_section:
+                bind_section = bind_panel
+            elif bind_section[-1] == ":" and bind_panel and ":" in bind_panel:
+                selector, bind_panel_file = bind_panel.split(":")
+                if ">" in bind_section:
+                    bind_section = bind_section + bind_panel_file
+                else:
+                    bind_section = selector + bind_section + bind_panel_file
+
+            bind = option.get("bind")
+            if not bind:
+                if bind_section:
+                    bind = bind_section
+                else:
+                    bind = "settings"
+            elif bind[-1] == ":" and bind_section and ":" in bind_section:
+                selector, bind_file = bind_section.split(":")
+                if ">" in bind:
+                    bind = bind + bind_file
+                else:
+                    bind = selector + bind + bind_file
+            if bind == "settings" and option.get("type", "string") == "file":
+                bind = "null"
+
+            option["bind"] = _hydrate_app_template(bind, settings)
+
+    def _dump_options_types_and_binds(self):
+        lines = []
+        for _, _, option in self._iterate():
+            lines.append(
+                "|".join([option["id"], option.get("type", "string"), option["bind"]])
+            )
+        return "\n".join(lines)
+
+
+app_settings_cache: Dict[str, Dict[str, Any]] = {}
+app_settings_cache_timestamp: Dict[str, float] = {}
+
+
+def _get_app_settings(app: str) -> Dict[str, Any]:
     """
     Get settings of an installed app
 
@@ -2026,12 +2086,22 @@ def _get_app_settings(app):
         app -- The app id (like nextcloud__2)
 
     """
-    if not _is_installed(app):
-        raise YunohostValidationError(
-            "app_not_installed", app=app, all_apps=_get_all_installed_apps_id()
-        )
+    _assert_is_installed(app)
+
+    global app_settings_cache
+    global app_settings_cache_timestamp
+
+    app_setting_path = os.path.join(APPS_SETTING_PATH, app, "settings.yml")
+    app_setting_timestamp = os.path.getmtime(app_setting_path)
+
+    # perf: app settings are cached using the settings.yml's modification date,
+    # such that we don't have to worry too much about calling this function
+    # too many times (because ultimately parsing yml is not free)
+    if app_settings_cache_timestamp.get(app) == app_setting_timestamp:
+        return app_settings_cache[app].copy()
+
     try:
-        with open(os.path.join(APPS_SETTING_PATH, app, "settings.yml")) as f:
+        with open(app_setting_path) as f:
             settings = yaml.safe_load(f) or {}
         # If label contains unicode char, this may later trigger issues when building strings...
         # FIXME: this should be propagated to read_yaml so that this fix applies everywhere I think...
@@ -2063,8 +2133,15 @@ def _get_app_settings(app):
         # Make the app id available as $app too
         settings["app"] = app
 
-        if app == settings["id"]:
-            return settings
+        # FIXME: it's not clear why this code exists... Shouldn't we hard-define 'id' as $app ...?
+        if app != settings["id"]:
+            return {}
+
+        # Cache the settings
+        app_settings_cache[app] = settings.copy()
+        app_settings_cache_timestamp[app] = app_setting_timestamp
+
+        return settings
     except (IOError, TypeError, KeyError):
         logger.error(m18n.n("app_not_correctly_installed", app=app))
     return {}
@@ -2081,6 +2158,11 @@ def _set_app_settings(app, settings):
     """
     with open(os.path.join(APPS_SETTING_PATH, app, "settings.yml"), "w") as f:
         yaml.safe_dump(settings, f, default_flow_style=False)
+
+    if app in app_settings_cache_timestamp:
+        del app_settings_cache_timestamp[app]
+    if app in app_settings_cache:
+        del app_settings_cache[app]
 
 
 def _get_manifest_of_app(path):
@@ -2689,16 +2771,6 @@ def _list_upgradable_apps():
 
 
 def _is_installed(app: str) -> bool:
-    """
-    Check if application is installed
-
-    Keyword arguments:
-        app -- id of App to check
-
-    Returns:
-        Boolean
-
-    """
     return os.path.isdir(APPS_SETTING_PATH + app)
 
 
@@ -2932,7 +3004,9 @@ def _get_conflicting_apps(domain, path, ignore_app=None):
         for p, a in apps_map[domain].items():
             if a["id"] == ignore_app:
                 continue
-            if path == p or path == "/" or p == "/":
+            if path == p or (
+                not path.startswith("/.well-known/") and (path == "/" or p == "/")
+            ):
                 conflicts.append((p, a["id"], a["label"]))
 
     return conflicts

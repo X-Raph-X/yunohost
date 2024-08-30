@@ -4,9 +4,9 @@ YNH_APT_INSTALL_DEPENDENCIES_REPLACE="true"
 
 # Define and install dependencies with a equivs control file
 #
-# example : ynh_install_app_dependencies dep1 dep2 "dep3|dep4|dep5"
+# example : ynh_apt_install_dependencies dep1 dep2 "dep3|dep4|dep5"
 #
-# usage: ynh_install_app_dependencies dep [dep [...]]
+# usage: ynh_apt_install_dependencies dep [dep [...]]
 # | arg: dep - the package name to install in dependence.
 # | arg: "dep1|dep2|…" - You can specify alternatives. It will require to install (dep1 or dep2, etc).
 #
@@ -54,7 +54,7 @@ ynh_apt_install_dependencies() {
             if [[ -f "/etc/php/$php_version/fpm/pool.d/$app.conf" ]]
             then
                 ynh_backup_if_checksum_is_different "/etc/php/$php_version/fpm/pool.d/$app.conf"
-                ynh_remove_fpm_config
+                ynh_config_remove_phpfpm
             fi
         fi
         # Store php_version into the config of this app
@@ -72,9 +72,9 @@ ynh_apt_install_dependencies() {
     # Specific tweak related to Postgresql (cf end of the helper)
     local psql_installed="$(_ynh_apt_package_is_installed "postgresql-$PSQL_VERSION" && echo yes || echo no)"
 
-    # The first time we run ynh_install_app_dependencies, we will replace the
+    # The first time we run ynh_apt_install_dependencies, we will replace the
     # entire control file (This is in particular meant to cover the case of
-    # upgrade script where ynh_install_app_dependencies is called with this
+    # upgrade script where ynh_apt_install_dependencies is called with this
     # expected effect) Otherwise, any subsequent call will add dependencies
     # to those already present in the equivs control file.
     if [[ $YNH_APT_INSTALL_DEPENDENCIES_REPLACE == "true" ]]
@@ -90,38 +90,39 @@ ynh_apt_install_dependencies() {
         dependencies="$current_dependencies, $dependencies"
     fi
 
-    # #############################
-    # Actual install using equivs #
-    # #############################
+    # ################
+    # Actual install #
+    # ################
 
-    # Prepare the virtual-dependency control file for equivs
+    # Prepare the virtual-dependency control file for dpkg-deb --build
     local TMPDIR=$(mktemp --directory)
-    cat >${TMPDIR}/control <<EOF # Make a control file for equivs-build
+    mkdir -p ${TMPDIR}/${app_ynh_deps}/DEBIAN
+    # For some reason, dpkg-deb insists for folder perm to be 755 and sometimes it's 777 o_O?
+    chmod -R 755 ${TMPDIR}/${app_ynh_deps}
+
+    cat >${TMPDIR}/${app_ynh_deps}/DEBIAN/control <<EOF
 Section: misc
 Priority: optional
 Package: ${app_ynh_deps}
 Version: ${version}
-Depends: ${dependencies}
+Depends: ${dependencies//,,/,}
 Architecture: all
+Maintainer: root@localhost
 Description: Fake package for ${app} (YunoHost app) dependencies
  This meta-package is only responsible of installing its dependencies.
 EOF
-
-    # Make sure to delete equivs' legacy compat file
-    # It's now handle somewhat magically through the control file
-    rm -f /usr/share/equivs/template/debian/compat
 
     _ynh_apt update
 
     _ynh_wait_dpkg_free
 
-    (
-        # NB: this is in a subshell (though not sure why exactly not just use pushd/popd...)
-        cd "$TMPDIR"
-        # Install the fake package without its dependencies with dpkg --force-depends
-        LC_ALL=C equivs-build ./control > ./equivs_log 2>&1 || { cat ./equivs_log; false; }
-        LC_ALL=C dpkg --force-depends --install "./${app_ynh_deps}_${version}_all.deb" > ./dpkg_log 2>&1
-    )
+    # Install the fake package without its dependencies with dpkg --force-depends
+    if ! LC_ALL=C dpkg-deb --build "${TMPDIR}/${app_ynh_deps}" "${TMPDIR}/${app_ynh_deps}.deb" > "${TMPDIR}/dpkg_log" 2>&1; then
+        cat "${TMPDIR}/dpkg_log" >&2
+        ynh_die --message="Unable to install dependencies"
+    fi
+    # Don't crash in case of error, because is nicely covered by the following line
+    LC_ALL=C dpkg --force-depends --install "${TMPDIR}/${app_ynh_deps}.deb" 2>&1 | tee "${TMPDIR}/dpkg_log" || true
 
     # Then install the missing dependencies with apt install
     _ynh_apt_install --fix-broken || {
@@ -134,12 +135,12 @@ EOF
         # Fake an install of those dependencies to see the errors
         # The sed command here is, Print only from 'Reading state info' to the end.
         [[ -n "$problematic_dependencies" ]] && _ynh_apt_install $problematic_dependencies --dry-run 2>&1 | sed --quiet '/Reading state info/,$p' | grep -v "fix-broken\|Reading state info" >&2
-        ynh_die "Unable to install dependencies"
+        ynh_die "Unable to install apt dependencies"
     }
     rm --recursive --force "$TMPDIR" # Remove the temp dir.
 
     # check if the package is actually installed
-    _ynh_apt_package_is_installed "${app_ynh_deps}" || ynh_die "Unable to install dependencies"
+    _ynh_apt_package_is_installed "${app_ynh_deps}" || ynh_die "Unable to install apt dependencies"
 
     # Specific tweak related to Postgresql
     # -> trigger postgresql regenconf if we may have just installed postgresql
@@ -198,14 +199,30 @@ ynh_apt_install_dependencies_from_extra_repository() {
     # ===========================================
 
     # Split the repository into uri, suite and components.
-    repo="${repo#deb }"
-    local uri="$(echo "$repo" | awk '{ print $1 }')"
-    local suite="$(echo "$repo" | awk '{ print $2 }')"
-    local component="${repo##$uri $suite }"
+    IFS=', ' read -r -a repo_parts <<< "$repo"
+    index=0
+
+    # Remove "deb " at the beginning of the repo.
+    if [[ "${repo_parts[0]}" == "deb" ]]; then
+        index=1
+    fi
+    uri="${repo_parts[$index]}" ; index=$((index+1))
+    suite="${repo_parts[$index]}" ; index=$((index+1))
+
+    # Get the components
+    if (( "${#repo_parts[@]}" > 0 )); then
+        component="${repo_parts[*]:$index}"
+    fi
+
+    if [[ "$key" == "trusted=yes" ]]; then
+        trust="[trusted=yes]"
+    else
+        trust=""
+    fi
 
     # Add the new repo in sources.list.d
     mkdir --parents "/etc/apt/sources.list.d"
-    echo "deb $uri $suite $component" > "/etc/apt/sources.list.d/$app.list"
+    echo "deb $trust $uri $suite $component" > "/etc/apt/sources.list.d/$app.list"
 
     # Pin the new repo with the default priority, so it won't be used for upgrades.
     # Build $pin from the uri without http and any sub path
@@ -220,9 +237,11 @@ Pin: origin $pin
 Pin-Priority: 995
 EOF
 
-    mkdir --parents "/etc/apt/trusted.gpg.d"
-    # Timeout option is here to enforce the timeout on dns query and tcp connect (c.f. man wget)
-    wget --timeout 900 --quiet "$key" --output-document=- | gpg --dearmor > /etc/apt/trusted.gpg.d/$app.gpg
+    if [ -n "$key" ] && [[ "$key" != "trusted=yes" ]]; then
+        mkdir --parents "/etc/apt/trusted.gpg.d"
+        # Timeout option is here to enforce the timeout on dns query and tcp connect (c.f. man wget)
+        wget --timeout 900 --quiet "$key" --output-document=- | gpg --dearmor > /etc/apt/trusted.gpg.d/$app.gpg
+    fi
 
     # Update the list of package with the new repo NB: we use -o
     # Dir::Etc::sourcelist to only refresh this repo, because

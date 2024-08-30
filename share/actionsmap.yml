@@ -1201,7 +1201,7 @@ backup:
             api: PUT /backups/<name>/restore
             arguments:
                 name:
-                    help: Name of the local backup archive
+                    help: Name or path of the backup archive
                 --system:
                     help: List of system parts to restore (or all if none is given)
                     nargs: "*"
@@ -1232,7 +1232,7 @@ backup:
             api: GET /backups/<name>
             arguments:
                 name:
-                    help: Name of the local backup archive
+                    help: Name or path of the backup archive
                 -d:
                     full: --with-details
                     help: Show additional backup information
@@ -2079,6 +2079,6 @@ diagnosis:
             api: PUT /diagnosis/unignore
             arguments:
                 --filter:
-                    help: Remove a filter (it should be an existing filter as listed with --list)
+                    help: Remove a filter (it should be an existing filter as listed with "ignore --list")
                     nargs: "*"
                     metavar: CRITERIA
