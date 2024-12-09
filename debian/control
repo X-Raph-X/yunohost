@@ -34,8 +34,7 @@ Recommends: yunohost-admin, yunohost-portal (>= 12.0)
  , bash-completion, rsyslog
  , unattended-upgrades
  , libdbd-ldap-perl, libnet-dns-perl
-Conflicts: iptables-persistent
- , apache2
+Conflicts: apache2
  , bind9
  , openresolv
  , systemd-resolved
